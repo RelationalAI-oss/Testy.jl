@@ -1,6 +1,6 @@
 module Testy
 
-import Test
+using Test
 
 # TODO refactor into patch to bring these into Base
 function pexec(re,subject,offset,options,match_data)
@@ -89,14 +89,6 @@ macro testset(args...)
     # return :($(Expr(:block, prolog, ts_expr)))
 end
 
-macro test(args...)
-    return esc(:($Test.@test($(args...))))
-end
-
-macro test_broken(args...)
-    return esc(:($Test.@test_broken($(args...))))
-end
-
 partial(str::AbstractString) = Regex(str, Base.DEFAULT_COMPILER_OPTS,
     Base.DEFAULT_MATCH_OPTS | Base.PCRE.PARTIAL_HARD)
 
@@ -124,6 +116,28 @@ end
 function showtests(args...)
 end
 
-export @testset, @test, @test_broken, runtests, showtests
+export @testset, @test_broken
+export runtests, showtests
+
+#
+# Purely delegated macros and functions
+#
+using Test: @test, @test_throws, @test_broken, @test_skip,
+    @test_warn, @test_nowarn, @test_logs, @test_deprecated
+using Test: @inferred
+using Test: detect_ambiguities, detect_unbound_args
+using Test: GenericString, GenericSet, GenericDict, GenericArray
+using Test: TestSetException
+using Test: get_testset, get_testset_depth
+using Test: AbstractTestSet, DefaultTestSet, record, finish
+
+export @test, @test_throws, @test_broken, @test_skip,
+    @test_warn, @test_nowarn, @test_logs, @test_deprecated
+export @inferred
+export detect_ambiguities, detect_unbound_args
+export GenericString, GenericSet, GenericDict, GenericArray
+export TestSetException
+export get_testset, get_testset_depth
+export AbstractTestSet, DefaultTestSet, record, finish
 
 end
