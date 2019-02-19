@@ -3,7 +3,7 @@ module Runtests
 using Testy
 
 function test()
-    @testset "t" for ch in ["a","b","c"]
+    @testsuite "t" for ch in ["a","b","c"]
         @testset "$ch" begin
             @test 1==1
             for i in 1:3
@@ -35,22 +35,22 @@ function closure(expected::Vector{String})
     sort(collect(cl))
 end
 
-function case(str::String, test::Function, depth::Int64,
-        expected::Vector{String}, args...)
-    println(str)
-    println("======")
-    state = runtests(test, depth, args...)
-    println()
-    seen = sort(collect(keys(filter(kv -> kv.second, state.seen))))
-    expected = sort(closure(expected))
-    @test seen == expected
-    state
+function case(str::String, test::Function, expected::Vector{String}, args...)
+    @testset "$str" begin
+        state = runtests(test, false, args...)
+        println()
+        seen = sort(collect(keys(filter(kv -> kv.second, state.seen))))
+        expected = sort(closure(expected))
+        @test seen == expected
+    end
 end
 
-case(str::String, test::Function, expected::Vector{String}, args...) =
-    case(str, test, typemax(Int64), expected, args...)
+@testsuite "Testy" begin
+    @testset "List top-level test sets" begin
+        seen = showtests(test)
+        @test sort(seen) == [ "t", "t/a", "t/b", "t/c" ]
+    end
 
-@testset "Testy" begin
     case("Run all tests", test,
         [ "t/a/1", "t/a/2", "t/a/3",
           "t/b/1", "t/b/2", "t/b/3",
@@ -77,19 +77,7 @@ case(str::String, test::Function, expected::Vector{String}, args...) =
         [ "t/a/1", "t/a/2", "t/a/3",
           "t/b/1",
           "t/c/1", "t/c/2", "t/c/3" ],
-        "¬t/b/2", "-t/b/3")
-
-    # "Print names of top-level test sets"
-    case("Show top-level test sets", test, 2,
-        [ "t/a", "t/b", "t/c" ]
-    )
-
-    # "Print names of top-level and second-level test sets"
-    case("Print names of top-level and second-level test sets", test, 3,
-        [ "t/a/1", "t/a/2", "t/a/3",
-          "t/b/1", "t/b/2", "t/b/3",
-          "t/c/1", "t/c/2", "t/c/3" ]
-    )
+        "!t/b/2", "!t/b/3")
 end
 
 end

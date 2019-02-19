@@ -2,57 +2,7 @@ module Testy
 
 using Test
 
-# TODO refactor into patch to bring these into Base
-"""
-Helper for `pmatch`.
-"""
-function pexec(re,subject,offset,options,match_data)
-    rc = ccall((:pcre2_match_8, Base.PCRE.PCRE_LIB), Cint,
-               (Ptr{Cvoid}, Ptr{UInt8}, Csize_t, Csize_t, Cuint, Ptr{Cvoid}, Ptr{Cvoid}),
-               re, subject, sizeof(subject), offset, options, match_data, Base.PCRE.MATCH_CONTEXT[])
-    # rc == -1 means no match, -2 means partial match.
-    rc < -2 && error("PCRE.exec error: $(err_message(rc))")
-    rc
-end
-
-"""
-Variant of `Base.match` that supports partial matches (when `Base.PCRE.PARTIAL_HARD`
-is set in `re.match_options`).
-"""
-function pmatch(re::Regex, str::Union{SubString{String}, String}, idx::Integer, add_opts::UInt32=UInt32(0))
-    Base.compile(re)
-    opts = re.match_options | add_opts
-    # rc == -1 means no match, -2 means partial match.
-    rc = pexec(re.regex, str, idx-1, opts, re.match_data)
-    if rc == -1 || (rc == -2 && (re.match_options & Base.PCRE.PARTIAL_HARD) == 0)
-        return nothing
-    end
-    ovec = re.ovec
-    n = div(length(ovec),2) - 1
-    mat = SubString(str, ovec[1]+1, prevind(str, ovec[2]+1))
-    cap = Union{Nothing,SubString{String}}[ovec[2i+1] == PCRE.UNSET ? nothing :
-                                        SubString(str, ovec[2i+1]+1,
-                                                  prevind(str, ovec[2i+2]+1)) for i=1:n]
-    off = Int[ ovec[2i+1]+1 for i=1:n ]
-    RegexMatch(mat, cap, ovec[1]+1, off, re)
-end
-
-pmatch(r::Regex, s::AbstractString) = pmatch(r, s, firstindex(s))
-pmatch(r::Regex, s::AbstractString, i::Integer) = throw(ArgumentError(
-    "regex matching is only available for the String type; use String(s) to convert"
-))
-
-"""
-Constructs a regular expression to perform partial matching.
-"""
-partial(str::AbstractString) = Regex(str, Base.DEFAULT_COMPILER_OPTS,
-    Base.DEFAULT_MATCH_OPTS | Base.PCRE.PARTIAL_HARD)
-
-"""
-Constructs a regular expression to perform exact maching.
-"""
-exact(str::AbstractString) = Regex(str)
-
+include("pmatch.jl")
 
 # struct TestySet <: Test.AbstractTestSet
 #     parent::Test.DefaultTestSet
@@ -73,18 +23,15 @@ exact(str::AbstractString) = Regex(str)
 # end
 
 """
-State maintained during a test run, consisting of a stack of strings
-for the nested `@testset`s, a maximum depth beyond which we skip `@testset`s,
-and a pair of regular expressions over `@testset` nestings used to decide
-which `@testset`s should be executed.  We also keep a record of tests run or
-skipped so that these can be reported at the end of the test run.
+State maintained during a test run.
 """
-struct TestyState
+mutable struct TestyState
     stack::Vector{String}
-    maxdepth::Int
     include::Regex
     exclude::Regex
     seen::Dict{String,Bool}
+    dryrun::Bool
+    underset::Bool
 end
 
 function open_testset(rs::TestyState, name::String)
@@ -99,44 +46,75 @@ end
 const ⊤ = r""       # matches any string
 const ⊥ = r"(?!)"   # matches no string
 
-TestyState() = TestyState([], typemax(Int64), ⊤, ⊥, Dict{String,Bool}())
+TestyState() = TestyState([], ⊤, ⊥, Dict{String,Bool}(), false, false)
 
-TestyState(maxdepth::Int, include::Regex, exclude::Regex) =
-   TestyState([], maxdepth, include, exclude, Dict{String,Bool}())
+TestyState(include::Regex, exclude::Regex, dryrun::Bool) =
+   TestyState([], include, exclude, Dict{String,Bool}(), dryrun, false)
 
-function checked_ts_expr(name::Expr, ts_expr::Expr)
+function checked_ts_expr(name::Expr, ts_expr::Expr, testsuite::Bool)
     quote
         tls = task_local_storage()
         rs = haskey(tls, :__TESTY_STATE__) ? tls[:__TESTY_STATE__] : TestyState()
-        print("  "^length(rs.stack))
+
+        # Guard against nesting of @testsuite under @testset
+        if $(testsuite) && rs.underset
+            error("Nested @testsuite under @testset is disallowed")
+        elseif !$testsuite
+            rs.underset = true
+        end
+
         path = open_testset(rs, $name)
-        shouldrun = length(rs.stack) <= rs.maxdepth &&
+        shouldrun = !(rs.dryrun && !$testsuite) &&
                 pmatch(rs.include, path) != nothing && pmatch(rs.exclude, path) == nothing
         rs.seen[path] = shouldrun
-        if shouldrun
-            print("Running ")
-            printstyled(path; bold=true)
-            println(" tests...")
-            $ts_expr
-        else
-            printstyled("Skipping $path tests...\n"; color=:light_black)
+
+        # Suppress status output during dry runs
+        if !rs.dryrun
+            print("  "^length(rs.stack))
+            label = $testsuite ? "test suite" : "test set"
+            if shouldrun
+                print("Running ")
+                printstyled(path; bold=true)
+                println(" $label...")
+            else
+                printstyled("Skipping $path $label...\n"; color=:light_black)
+            end
         end
+
+        if shouldrun
+            $ts_expr
+        end
+
         close_testset(rs)
     end
 end
 
-"Wrapped version of `Base.Test.@testset`."
+"""
+Wrapped version of `Base.Test.@testset`.  In Testy, test sets are also the
+smallest unit of parallelism.
+"""
 macro testset(args...)
     ts_expr = esc(:($Test.@testset($(args...))))
     desc, testsettype, options = Test.parse_testset_args(args[1:end-1])
-    return checked_ts_expr(desc, ts_expr)
+    return checked_ts_expr(desc, ts_expr, false)
 end
 
-function runtests(fun::Function, depth::Int64=typemax(Int64), args...)
+"""
+Like `Base.Test.@testset`, but used at a higher level to encapsulate a
+collection of test sets (possibly further nested within suites) that can be run
+in parallel.
+"""
+macro testsuite(args...)
+    ts_expr = esc(:($Test.@testset($(args...))))
+    desc, testsettype, options = Test.parse_testset_args(args[1:end-1])
+    return checked_ts_expr(desc, ts_expr, true)
+end
+
+function runtests(fun::Function, dryrun::Bool, args...)
     includes = []
     excludes = ["(?!)"]     # seed with an unsatisfiable regex
     for arg in args
-        if startswith(arg, "-") || startswith(arg, "¬")
+        if startswith(arg, "!")
             push!(excludes, arg[nextind(arg,1):end])
         else
             push!(includes, arg)
@@ -144,58 +122,45 @@ function runtests(fun::Function, depth::Int64=typemax(Int64), args...)
     end
     include = partial(join(includes, "|"))
     exclude = exact(join(excludes, "|"))
-    state = TestyState(depth, include, exclude)
+    state = TestyState(include, exclude, dryrun)
     task_local_storage(:__TESTY_STATE__, state) do
         fun()
     end
     state
 end
 
-"""
-Include file `filepath` and execute test sets matching the regular expressions
-in `args`.  See alternative form of `runtests` for examples.
-"""
-function runtests(filepath::String, args...)
-    runtests(typemax(Int), args...) do
-        include(filepath)
-    end
-end
-
-"""
-Include file `test/runtests.jl` and execute test sets matching the regular
-expressions in `args` (where a leading '-' or '¬' indicates that tests
-matching the expression should be excluded).
-
-# Examples
-```jldoctest
-julia> runtests(["t/a/.*"])         # Run all tests under `t/a`
-
-julia> runtests(["t/.*", "¬t/b/2"])  # Run all tests under `t` except `t/b/2`
-```
-"""
-function runtests(args::Vector{String})
+function include_runtests()
     testfile = pwd() * "/test/runtests.jl"
     if !isfile(testfile)
         @error("Could not find test/runtests.jl")
         return
     end
-    runtests(testfile, args...)
-end
+    include(testfile)
+ end
 
 """
-Run test sets up to the provided nesting `depth` and matching the regular
-expressions in `args`.
+Include file `test/runtests.jl` and execute test sets, optionally restricting
+them to those matching the regular expressions in `args`.  (A leading '!'
+indicates that tests matching the expression should be excluded.)
+
+ # Examples
+ ```jldoctest
+julia> runtests("t/a/.*")           # Run all tests under `t/a`
+
+julia> runtests("t/.*", "!t/b/2")   # Run all tests under `t` except `t/b/2`
+ ```
 """
-function runtests(depth::Int, args...)
-    testfile = pwd() * "/test/runtests.jl"
-    if !isfile(testfile)
-        @error("Could not find test/runtests.jl")
-        return
-    end
-    runtests(testfile, depth, args...)
+runtests(args...) = runtests(include_runtests, false, args...)
+
+"""
+List test suites and top-level test sets.
+"""
+function showtests(fun::Function=include_runtests)
+    state = runtests(fun, true)
+    collect(keys(state.seen))
 end
 
-export @testset, @test_broken
+export @testset, @testsuite, @test_broken
 export runtests, showtests
 
 #
