@@ -1,6 +1,7 @@
 module Testy
 
 using Distributed
+using Suppressor
 using Test
 
 include("pmatch.jl")
@@ -116,7 +117,7 @@ function Test.record(state::TestState, set::Test.AbstractTestSet)
     end
 end
 
-function Test.record(state::TestState, err::TestSetException)
+function Test.record(state::TestState, err::Exception)
     if state.parallel_state != nothing
         put!(state.parallel_state.results, err)
     end
@@ -240,7 +241,11 @@ end
 
 function runtests_serial(filename::String, state::TestState)
     task_local_storage(:__TESTY_STATE__, state) do
-        include(filename)
+        if state.dryrun
+            @suppress include(filename)
+        else
+            include(filename)
+        end
     end
 end
 
@@ -265,9 +270,13 @@ function runtests_parallel(filename::String, state::TestState, num_workers::Int)
     num_jobs = ntests(filename, state)
     num_workers = max(min(num_workers, num_jobs), 1)
 
+    if num_workers == 1
+       return runtests_serial(filename, state)
+    end
+
     addprocs(max(0, num_workers-nworkers()))
 
-    printstyled("Running tests in parallel with $(nworkers()) workers\n",
+    printstyled("Running tests in parallel with $num_workers workers\n",
         color=:cyan)
 
     @everywhere @eval(Main, using Testy)
@@ -314,8 +323,8 @@ end
 List test suites and top-level test sets.
 """
 function showtests(filename="test/runtests.jl")
-    state = runtests(filename, true)
-    collect(keys(state.seen))
+    state = runtests(; filename=filename, dryrun=true)
+    map(kv -> kv[1], state.seen)
 end
 
 export @testset, @testsuite, @test_broken
