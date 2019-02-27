@@ -1,5 +1,6 @@
 module Testy
 
+using Distributed
 using Test
 
 include("pmatch.jl")
@@ -23,50 +24,112 @@ include("pmatch.jl")
 # end
 
 """
+State for parallel test workers.
+"""
+struct ParallelState
+    # Channel for retrieving @testset indices to process
+    jobs::RemoteChannel{Channel{Int}}
+
+    # Channel for sending results
+    results::RemoteChannel{Channel{Any}}
+
+    # Index of the next top-level @testset this worker should run
+    ts_next::Int
+end
+
+"""
 State maintained during a test run.
 """
-mutable struct TestyState
+mutable struct TestState
     stack::Vector{String}
     include::Regex
     exclude::Regex
-    seen::Dict{String,Bool}
+
+    # test sets/suites encountered
+    seen::Vector{Tuple{String,Bool}}
     dryrun::Bool
-    underset::Bool
-end
 
-function open_testset(rs::TestyState, name::String)
-    push!(rs.stack, name)
-    join(rs.stack, "/")
-end
+    # depth of current @testset nesting
+    ts_depth::Int
 
-function close_testset(rs::TestyState)
-    pop!(rs.stack)
+    # Count of top-level @testsets encountered so far by this worker
+    ts_count::Int
+
+    # state for parallel workers
+    parallel_state::Union{ParallelState, Nothing}
 end
 
 const ⊤ = r""       # matches any string
 const ⊥ = r"(?!)"   # matches no string
 
-TestyState() = TestyState([], ⊤, ⊥, Dict{String,Bool}(), false, false)
+TestState() = TestState([], ⊤, ⊥, [], false, 0, 0, nothing)
 
-TestyState(include::Regex, exclude::Regex, dryrun::Bool) =
-   TestyState([], include, exclude, Dict{String,Bool}(), dryrun, false)
+TestState(include::Regex, exclude::Regex, dryrun::Bool) =
+   TestState([], include, exclude, [], dryrun, 0, 0, nothing)
 
-function checked_ts_expr(name::Expr, ts_expr::Expr, testsuite::Bool)
-    quote
-        tls = task_local_storage()
-        rs = haskey(tls, :__TESTY_STATE__) ? tls[:__TESTY_STATE__] : TestyState()
+function open_testset(rs::TestState, name::String, testsuite::Bool)
+    # Guard against nesting of @testsuite under @testset
+    if testsuite && rs.ts_depth > 0
+        error("Nested @testsuite under @testset is disallowed")
+    elseif !testsuite
+        if rs.ts_depth == 0
+            rs.ts_count += 1
+        end
+        rs.ts_depth += 1
+    end
 
-        # Guard against nesting of @testsuite under @testset
-        if $(testsuite) && rs.underset
-            error("Nested @testsuite under @testset is disallowed")
-        elseif !$testsuite
-            rs.underset = true
+    push!(rs.stack, name)
+    join(rs.stack, "/")
+end
+
+function close_testset(rs::TestState, testsuite::Bool, shouldrun::Bool)
+    pop!(rs.stack)
+    if !testsuite
+        rs.ts_depth -= 1
+    end
+
+    if shouldrun && rs.parallel_state != nothing && rs.ts_depth == 0
+        # Fetch next job
+        rs.parallel_state.ts_next = take!(rs.parallel_state.jobs)
+    end
+end
+
+function ts_should_run(rs::TestState, path::String, testsuite::Bool)
+    if !(rs.dryrun && !testsuite) &&
+        pmatch(rs.include, path) != nothing &&
+        pmatch(rs.exclude, path) == nothing
+
+        if testsuite || rs.parallel_state == nothing
+            return true
+        elseif rs.parallel_state != nothing &&
+            rs.ts_count == rs.parallel_state.ts_next
+            return true
         end
 
-        path = open_testset(rs, $name)
-        shouldrun = !(rs.dryrun && !$testsuite) &&
-                pmatch(rs.include, path) != nothing && pmatch(rs.exclude, path) == nothing
-        rs.seen[path] = shouldrun
+    end
+    return false
+end
+
+function Test.record(state::TestState, set::Test.AbstractTestSet)
+    if state.parallel_state != nothing
+        put!(state.parallel_state.results, set)
+    end
+end
+
+function Test.record(state::TestState, err::TestSetException)
+    if state.parallel_state != nothing
+        put!(state.parallel_state.results, err)
+    end
+end
+
+function checked_ts_expr(name::Expr, ts_expr::Expr, testsuite::Bool, source)
+    quote
+        tls = task_local_storage()
+        rs = haskey(tls, :__TESTY_STATE__) ? tls[:__TESTY_STATE__] : TestState()
+
+        path = open_testset(rs, $name, $testsuite)
+        shouldrun = ts_should_run(rs, path, $testsuite)
+        push!(rs.seen, (path, shouldrun))
 
         # Suppress status output during dry runs
         if !rs.dryrun
@@ -82,10 +145,16 @@ function checked_ts_expr(name::Expr, ts_expr::Expr, testsuite::Bool)
         end
 
         if shouldrun
-            $ts_expr
+            try
+                ts = $ts_expr
+                record(rs, ts)
+            catch err
+                err isa InterruptException && rethrow()
+                record(rs, err)
+            end
         end
 
-        close_testset(rs)
+        close_testset(rs, $testsuite, shouldrun)
     end
 end
 
@@ -96,7 +165,7 @@ smallest unit of parallelism.
 macro testset(args...)
     ts_expr = esc(:($Test.@testset($(args...))))
     desc, testsettype, options = Test.parse_testset_args(args[1:end-1])
-    return checked_ts_expr(desc, ts_expr, false)
+    return checked_ts_expr(desc, ts_expr, false, __source__)
 end
 
 """
@@ -107,36 +176,26 @@ in parallel.
 macro testsuite(args...)
     ts_expr = esc(:($Test.@testset($(args...))))
     desc, testsettype, options = Test.parse_testset_args(args[1:end-1])
-    return checked_ts_expr(desc, ts_expr, true)
+    return checked_ts_expr(desc, ts_expr, true, __source__)
 end
 
-function runtests(fun::Function, dryrun::Bool, args...)
-    includes = []
-    excludes = ["(?!)"]     # seed with an unsatisfiable regex
-    for arg in args
-        if startswith(arg, "!")
-            push!(excludes, arg[nextind(arg,1):end])
-        else
-            push!(includes, arg)
+function get_num_workers()
+    str = get(ENV, "TESTY_WORKERS", "")
+    if str == ""
+        return 1
+    else
+        try
+            num_workers = parse(Int, str)
+            if num_workers > 0
+                return num_workers
+            end
+        catch
         end
-    end
-    include = partial(join(includes, "|"))
-    exclude = exact(join(excludes, "|"))
-    state = TestyState(include, exclude, dryrun)
-    task_local_storage(:__TESTY_STATE__, state) do
-        fun()
-    end
-    state
-end
 
-function include_runtests()
-    testfile = pwd() * "/test/runtests.jl"
-    if !isfile(testfile)
-        @error("Could not find test/runtests.jl")
-        return
+        warn("Invalid number of workers in TESTY_WORKERS: $str")
+        return 1
     end
-    include(testfile)
- end
+end
 
 """
 Include file `test/runtests.jl` and execute test sets, optionally restricting
@@ -150,13 +209,112 @@ julia> runtests("t/a/.*")           # Run all tests under `t/a`
 julia> runtests("t/.*", "!t/b/2")   # Run all tests under `t` except `t/b/2`
  ```
 """
-runtests(args...) = runtests(include_runtests, false, args...)
+function runtests(args...; filename::String="test/runtests.jl", dryrun::Bool=false)
+    # if !isfile(filename)
+    #     error("Cannot find test file $filename")
+    # end
+
+    includes = []
+    excludes = ["(?!)"]     # seed with an unsatisfiable regex
+    for arg in args
+        if startswith(arg, "!")
+            push!(excludes, arg[nextind(arg,1):end])
+        else
+            push!(includes, arg)
+        end
+    end
+    include = partial(join(includes, "|"))
+    exclude = exact(join(excludes, "|"))
+    state = TestState(include, exclude, dryrun)
+
+    num_workers = get_num_workers()
+
+    if num_workers == 1
+        runtests_serial(filename, state)
+    else
+        runtests_parallel(filename, state, num_workers)
+    end
+
+    state
+end
+
+function runtests_serial(filename::String, state::TestState)
+    task_local_storage(:__TESTY_STATE__, state) do
+        include(filename)
+    end
+end
+
+function runtests_worker(filename::String, state::TestState,
+    jobs::RemoteChannel, results::RemoteChannel, job::Int)
+
+    state.parallel_state = ParallelState(jobs, results, 0, job)
+    task_local_storage(:__TESTY_STATE__, state) do
+        include(filename)
+    end
+
+    put!(results, :worker_done)
+end
+
+function ntests(filename::String, state::TestState)
+    (dryrun, state.dryrun) = (state.dryrun, true)
+    runtests_serial(filename, state)
+    state.dryrun = dryrun
+end
+
+function runtests_parallel(filename::String, state::TestState, num_workers::Int)
+    num_jobs = ntests(filename, state)
+    num_workers = max(min(num_workers, num_jobs), 1)
+
+    addprocs(max(0, num_workers-nworkers()))
+
+    printstyled("Running tests in parallel with $(nworkers()) workers\n",
+        color=:cyan)
+
+    @everywhere @eval(Main, using Testy)
+
+    jobs = RemoteChannel(()->Channel{Int}(num_jobs))
+    results = RemoteChannel(()->Channel{Any}(0))
+
+    result_vector = Vector{Any}()
+
+    try
+        @sync begin
+            for (i,pid) in enumerate(workers())
+                @spawnat(pid, runtests_worker(filename, state, jobs, results, i))
+            end
+
+            for i in num_workers:num_jobs
+                put!(jobs, i)
+            end
+
+            @async begin
+                completed = 0
+                while completed < num_workers
+                    result = take!(results)
+                    if result == :worker_done
+                        completed += 1
+                    else
+                        push!(result, results)
+                    end
+                end
+            end
+        end
+    catch err
+        if err isa CompositeException
+            @info :distributed_run_catch err    # TODO
+        else
+            @info :distributed_run_catch err
+        end
+    end
+
+    result_vector
+end
 
 """
 List test suites and top-level test sets.
 """
-function showtests(fun::Function=include_runtests)
-    state = runtests(fun, true)
+function showtests(filename="test/runtests.jl")
+    state = runtests(filename, true)
     collect(keys(state.seen))
 end
 
