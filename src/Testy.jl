@@ -1,5 +1,6 @@
 module Testy
 
+using Base.PCRE
 using Distributed
 using Suppressor
 using Test
@@ -226,11 +227,11 @@ function runtests(args...; filename::String="test/runtests.jl", dryrun::Bool=fal
     end
     include = partial(join(includes, "|"))
     exclude = exact(join(excludes, "|"))
-    state = TestState(include, exclude, dryrun)
 
+    state = TestState(include, exclude, dryrun)
     num_workers = get_num_workers()
 
-    if num_workers == 1
+    if num_workers == 1 || dryrun
         runtests_serial(filename, state)
     else
         runtests_parallel(filename, state, num_workers)
@@ -261,9 +262,9 @@ function runtests_worker(filename::String, state::TestState,
 end
 
 function ntests(filename::String, state::TestState)
-    (dryrun, state.dryrun) = (state.dryrun, true)
-    runtests_serial(filename, state)
-    state.dryrun = dryrun
+    state2 = TestState(state.include, state.exclude, true)
+    runtests_serial(filename, state2)
+    state2.ts_count
 end
 
 function runtests_parallel(filename::String, state::TestState, num_workers::Int)
@@ -271,7 +272,9 @@ function runtests_parallel(filename::String, state::TestState, num_workers::Int)
     num_workers = max(min(num_workers, num_jobs), 1)
 
     if num_workers == 1
-       return runtests_serial(filename, state)
+        msg = num_jobs == 0 ? "no top-level test sets were" : "only one top-level test set was"
+        @warn "Running tests in serial as $msg found"
+        return runtests_serial(filename, state)
     end
 
     addprocs(max(0, num_workers-nworkers()))

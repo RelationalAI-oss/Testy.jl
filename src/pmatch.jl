@@ -7,20 +7,22 @@ function pexec(re,subject,offset,options,match_data)
                (Ptr{Cvoid}, Ptr{UInt8}, Csize_t, Csize_t, Cuint, Ptr{Cvoid}, Ptr{Cvoid}),
                re, subject, sizeof(subject), offset, options, match_data, Base.PCRE.MATCH_CONTEXT[])
     # rc == -1 means no match, -2 means partial match.
-    rc < -2 && error("PCRE.exec error: $(err_message(rc))")
+    rc < -2 && error("PCRE.exec error: $(PCRE.err_message(rc))")
     rc
 end
 
+# TODO rename pmatch -> partialmatch, pass Base.PCRE.PARTIAL_HARD,
 """
-Variant of `Base.match` that supports partial matches (when `Base.PCRE.PARTIAL_HARD`
-is set in `re.match_options`).
+Variant of `Base.match` that supports partial matches (when
+`Base.PCRE.PARTIAL_SOFT` or `Base.PCRE.PARTIAL_HARD` is set in
+`re.match_options` or passed via `add_opts`).
 """
 function pmatch(re::Regex, str::Union{SubString{String}, String}, idx::Integer, add_opts::UInt32=UInt32(0))
     Base.compile(re)
     opts = re.match_options | add_opts
     # rc == -1 means no match, -2 means partial match.
     rc = pexec(re.regex, str, idx-1, opts, re.match_data)
-    if rc == -1 || (rc == -2 && (re.match_options & Base.PCRE.PARTIAL_HARD) == 0)
+    if rc == -1 || (rc == -2 && (opts & Base.PCRE.PARTIAL_HARD) == 0)
         return nothing
     end
     ovec = re.ovec
@@ -42,7 +44,7 @@ pmatch(r::Regex, s::AbstractString, i::Integer) = throw(ArgumentError(
 Constructs a regular expression to perform partial matching.
 """
 partial(str::AbstractString) = Regex(str, Base.DEFAULT_COMPILER_OPTS,
-    Base.DEFAULT_MATCH_OPTS | Base.PCRE.PARTIAL_HARD)
+        Base.DEFAULT_MATCH_OPTS | Base.PCRE.PARTIAL_HARD)
 
 """
 Constructs a regular expression to perform exact maching.
