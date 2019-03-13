@@ -7,6 +7,17 @@ using Test
 
 include("pmatch.jl")
 
+eat(args...) = nothing
+
+const trace_enabled = false
+if trace_enabled
+    trace = print
+    traceln = println
+else
+    trace = eat
+    traceln = eat
+end
+
 # struct TestySet <: Test.AbstractTestSet
 #     parent::Test.DefaultTestSet
 #
@@ -28,12 +39,12 @@ include("pmatch.jl")
 """
 State for parallel test workers.
 """
-struct ParallelState
+mutable struct ParallelState
     # Channel for retrieving @testset indices to process
-    jobs::RemoteChannel{Channel{Int}}
+    jobs::AbstractChannel{Int}
 
     # Channel for sending results
-    results::RemoteChannel{Channel{Any}}
+    results::AbstractChannel{Any}
 
     # Index of the next top-level @testset this worker should run
     ts_next::Int
@@ -69,6 +80,9 @@ TestState() = TestState([], ⊤, ⊥, [], false, 0, 0, nothing)
 TestState(include::Regex, exclude::Regex, dryrun::Bool) =
    TestState([], include, exclude, [], dryrun, 0, 0, nothing)
 
+TestState(s::TestState) = TestState(copy(s.stack), s.include, s.exclude,
+    copy(s.seen), s.dryrun, s.ts_depth, s.ts_count, s.parallel_state)
+
 function open_testset(rs::TestState, name::String, testsuite::Bool)
     # Guard against nesting of @testsuite under @testset
     if testsuite && rs.ts_depth > 0
@@ -85,14 +99,18 @@ function open_testset(rs::TestState, name::String, testsuite::Bool)
 end
 
 function close_testset(rs::TestState, testsuite::Bool, shouldrun::Bool)
+    traceln("Closing $(rs.stack)")
     pop!(rs.stack)
     if !testsuite
         rs.ts_depth -= 1
     end
 
-    if shouldrun && rs.parallel_state != nothing && rs.ts_depth == 0
+    if shouldrun && !testsuite && rs.parallel_state != nothing && rs.ts_depth == 0
         # Fetch next job
         rs.parallel_state.ts_next = take!(rs.parallel_state.jobs)
+        traceln("Got job $(rs.parallel_state.ts_next)")
+    else
+        traceln("Not fetching next job ($shouldrun, $(rs.ts_depth))")
     end
 end
 
@@ -112,16 +130,34 @@ function ts_should_run(rs::TestState, path::String, testsuite::Bool)
     return false
 end
 
-function Test.record(state::TestState, set::Test.AbstractTestSet)
+function tally(state::TestState, set::Test.AbstractTestSet)
     if state.parallel_state != nothing
+        traceln("Putting result...")
         put!(state.parallel_state.results, set)
+        traceln("Done.")
     end
 end
 
-function Test.record(state::TestState, err::Exception)
+function tally(state::TestState, err::Exception)
     if state.parallel_state != nothing
+        traceln("Putting exception...")
         put!(state.parallel_state.results, err)
+        traceln("Done.")
     end
+end
+
+function tally(state::TestState, sets::AbstractVector)
+    for set in sets
+        tally(state, set)
+    end
+end
+
+function tally(state::TestState, any)
+    printstyled("tally\n"; color=:light_red)
+    for fr in stacktrace()
+        printstyled(" $fr\n", color=:light_red)
+    end
+    error(stacktrace())
 end
 
 function checked_ts_expr(name::Expr, ts_expr::Expr, testsuite::Bool, source)
@@ -135,7 +171,7 @@ function checked_ts_expr(name::Expr, ts_expr::Expr, testsuite::Bool, source)
 
         # Suppress status output during dry runs
         if !rs.dryrun
-            print("  "^length(rs.stack))
+            trace("  "^length(rs.stack))
             label = $testsuite ? "test suite" : "test set"
             if shouldrun
                 print("Running ")
@@ -149,10 +185,10 @@ function checked_ts_expr(name::Expr, ts_expr::Expr, testsuite::Bool, source)
         if shouldrun
             try
                 ts = $ts_expr
-                record(rs, ts)
+                tally(rs, ts)   # @testset ... begin ... end
             catch err
                 err isa InterruptException && rethrow()
-                record(rs, err)
+                tally(rs, err)
             end
         end
 
@@ -250,15 +286,31 @@ function runtests_serial(filename::String, state::TestState)
     end
 end
 
-function runtests_worker(filename::String, state::TestState,
-    jobs::RemoteChannel, results::RemoteChannel, job::Int)
+function runtests_worker(path::String, filename::String, state::TestState,
+    jobs::AbstractChannel, results::AbstractChannel, job::Int)
+    # try
+        traceln("path=$path, filename=$filename, job=$job")
 
-    state.parallel_state = ParallelState(jobs, results, 0, job)
-    task_local_storage(:__TESTY_STATE__, state) do
-        include(filename)
-    end
+        state.parallel_state = ParallelState(jobs, results, job)
+        task_local_storage(:__TESTY_STATE__, state) do
+            task_local_storage(:SOURCE_PATH, path) do
+                @suppress include(filename)
+            end
+        end
 
-    put!(results, :worker_done)
+        traceln("Putting done...")
+        # dump(results)
+        put!(results, state)
+        traceln("Done.")
+    # catch err
+    #     printstyled("EGADS!!!\n"; color=:green)
+    #     println(err)
+    #     printstyled("printing backtrace\n"; color=:green)
+    #     show(stacktrace(catch_backtrace()))
+    #     println()
+    #     printstyled("EGADS!!! (end)\n"; color=:green)
+    #     # rethrow(err)
+    # end
 end
 
 function ntests(filename::String, state::TestState)
@@ -271,56 +323,149 @@ function runtests_parallel(filename::String, state::TestState, num_workers::Int)
     num_jobs = ntests(filename, state)
     num_workers = max(min(num_workers, num_jobs), 1)
 
-    if num_workers == 1
-        msg = num_jobs == 0 ? "no top-level test sets were" : "only one top-level test set was"
-        @warn "Running tests in serial as $msg found"
-        return runtests_serial(filename, state)
-    end
-
-    addprocs(max(0, num_workers-nworkers()))
+    # if num_workers == 1
+    #     msg = num_jobs == 0 ? "no top-level test sets were" : "only one top-level test set was"
+    #     @warn "Running tests in serial as $msg found"
+    #     return runtests_serial(filename, state)
+    # end
+    num_workers = 2
 
     printstyled("Running tests in parallel with $num_workers workers\n",
         color=:cyan)
 
-    @everywhere @eval(Main, using Testy)
-
-    jobs = RemoteChannel(()->Channel{Int}(num_jobs))
-    results = RemoteChannel(()->Channel{Any}(0))
-
     result_vector = Vector{Any}()
 
     try
-        @sync begin
-            for (i,pid) in enumerate(workers())
-                @spawnat(pid, runtests_worker(filename, state, jobs, results, i))
+        jobs = #RemoteChannel() do
+            Channel(ctype=Int, csize=0) do jobs
+                for i in num_workers+1:num_jobs
+                    traceln("Putting job $i")
+                    put!(jobs, i)
+                end
+                for i in 1:num_workers
+                    put!(jobs, 0)
+                end
             end
+        #end
 
-            for i in num_workers:num_jobs
-                put!(jobs, i)
-            end
-
-            @async begin
+        taskref = Ref{Task}()
+        results = #RemoteChannel() do
+            Channel(ctype=Any, csize=0, taskref=taskref) do results
                 completed = 0
                 while completed < num_workers
                     result = take!(results)
-                    if result == :worker_done
+                    traceln("Got result: $(typeof(result))")
+                    push!(result_vector, result)
+                    if result isa TestState
                         completed += 1
-                    else
-                        push!(result, results)
+                    # elseif result isa Exception
+                    #     throw(result)
                     end
                 end
+                traceln("Done collecting results")
             end
+        #end
+
+        path = task_local_storage(:SOURCE_PATH)
+
+        pids = workers()
+        for i in 1:num_workers
+            @async(runtests_worker(path, filename, TestState(state),
+                jobs, results, i))
         end
+
+        wait(taskref[])
+
+        collate_results!(state, result_vector)
+
+        printstyled("Results:\n"; color=:light_yellow)
+        for r in result_vector
+            printstyled(r; color=:light_yellow)
+            println()
+        end
+
     catch err
-        if err isa CompositeException
-            @info :distributed_run_catch err    # TODO
-        else
-            @info :distributed_run_catch err
+        sleep(20)
+        rethrow(err)
+    end
+end
+
+function collate_results!(state::TestState, results::Vector{Any})
+    for result in results
+        if result isa TestState
+            traceln("collate_results: appending ", result.seen)
+            append!(state.seen, result.seen)
         end
     end
-
-    result_vector
+    state.seen = unique(state.seen) # KLUDGE, FIXME
+    traceln("collage_results: => ", state.seen)
+    state
 end
+
+# function runtests_distributed(filename::String, state::TestState, num_workers::Int)
+#     num_jobs = ntests(filename, state)
+#     num_workers = max(min(num_workers, num_jobs), 1)
+#
+#     if num_workers == 1
+#         msg = num_jobs == 0 ? "no top-level test sets were" : "only one top-level test set was"
+#         @warn "Running tests in serial as $msg found"
+#         return runtests_serial(filename, state)
+#     end
+#
+#     addprocs(max(0, num_workers-nworkers()))
+#
+#     printstyled("Running tests in parallel with $num_workers workers\n",
+#         color=:cyan)
+#
+#     @everywhere @eval(Main, using Testy)
+#
+#     result_vector = Vector{Any}()
+#
+#     try
+#         @sync begin
+#             jobs = RemoteChannel(()->Channel{Int}(0)) do
+#                 for i in num_workers:num_jobs
+#                     println("Putting job $i")
+#                     put!(jobs, i)
+#                 end
+#             end
+#
+#             path = task_local_storage(:SOURCE_PATH)
+#
+#             pids = workers()
+#             for i in 1:num_workers
+#                 @spawnat(pids[i], runtests_worker(path, filename, state,
+#                     jobs, results, i))
+#             end
+#
+#             results = RemoteChannel(()->Channel{Any}(0))
+#
+#             @async begin
+#                 completed = 0
+#                 while completed < num_workers
+#                     result = take!(results)
+#                     push!(result, result_vector)
+#
+#                     println("Got result: $(typeof(result))")
+#                     if result isa TestState
+#                         completed += 1
+#                     end
+#                 end
+#                 println("Done collecting results")
+#             end
+#         end
+#     catch err
+#         if err isa CompositeException
+#             @info :distributed_run_catch err    # TODO
+#             push!(err, result_vector)
+#         else
+#             @info :distributed_run_catch err
+#             push!(err, result_vector)
+#         end
+#     end
+#
+#     collate_results!(state, result_vector)
+# end
 
 """
 List test suites and top-level test sets.

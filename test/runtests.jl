@@ -38,10 +38,10 @@ function case(str::String, expected::Vector{String}, args...)
 end
 
 @testsuite "Testy" begin
-    @testset "List top-level test sets" begin
-        seen = showtests("runtests2.jl")
-        @test sort(seen) == [ "t", "t/a", "t/b", "t/c" ]
-    end
+    # @testset "List top-level test sets" begin
+    #     seen = showtests("runtests2.jl")
+    #     @test sort(seen) == [ "t", "t/a", "t/b", "t/c" ]
+    # end
 
     case("Run all tests",
         [ "t/a/1", "t/a/2", "t/a/3",
@@ -49,27 +49,27 @@ end
           "t/c/1", "t/c/2", "t/c/3" ]
     )
 
-    case("Run everything under 't/a'",
-        [ "t/a/1", "t/a/2", "t/a/3" ],
-         "t/a/.*"
-    )
-
-    # "Run 'a/2'"
-    case("Run 't/a/2'",
-        [ "t/a/2" ],
-         "t/a/2")
-
-    # "Run 'a/2' and 'b/3'"
-    case("Run 't/a/2' and 't/b/3'",
-        [ "t/a/2", "t/b/3" ],
-        "t/a/2", "t/b/3")
-
-    # "Run all except 'b/2' and 'b/3'"
-    case("Run all except 't/b/2' and 't/b/3'",
-        [ "t/a/1", "t/a/2", "t/a/3",
-          "t/b/1",
-          "t/c/1", "t/c/2", "t/c/3" ],
-        "!t/b/2", "!t/b/3")
+    # case("Run everything under 't/a'",
+    #     [ "t/a/1", "t/a/2", "t/a/3" ],
+    #      "t/a/.*"
+    # )
+    #
+    # # "Run 'a/2'"
+    # case("Run 't/a/2'",
+    #     [ "t/a/2" ],
+    #      "t/a/2")
+    #
+    # # "Run 'a/2' and 'b/3'"
+    # case("Run 't/a/2' and 't/b/3'",
+    #     [ "t/a/2", "t/b/3" ],
+    #     "t/a/2", "t/b/3")
+    #
+    # # "Run all except 'b/2' and 'b/3'"
+    # case("Run all except 't/b/2' and 't/b/3'",
+    #     [ "t/a/1", "t/a/2", "t/a/3",
+    #       "t/b/1",
+    #       "t/c/1", "t/c/2", "t/c/3" ],
+    #     "!t/b/2", "!t/b/3")
 end
 
 end
