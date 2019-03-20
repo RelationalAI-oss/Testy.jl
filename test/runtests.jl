@@ -21,21 +21,18 @@ function closure(expected::Vector{String})
     sort(collect(cl))
 end
 
-last_err = 0
-
 function case(str::String, expected::Vector{String}, args...)
     @testset "$str" begin
-        try
-            state = runtests(args...; filename="runtests2.jl")
-            seen = sort(collect(map(kv -> kv[1], filter(kv -> kv[2], state.seen))))
-            expected = sort(closure(expected))
-            @test seen == expected
-        catch err
-            global last_err = err
-            rethrow(err)
-        end
+        (state, results) = runtests(args...; filename="runtests2.jl")
+        seen = sort(collect(map(kv -> kv[1], filter(kv -> kv[2], state.seen))))
+        expected = sort(closure(expected))
+        @test seen == expected
+
+        return results
     end
 end
+
+results = nothing
 
 @testsuite "Testy" begin
     # @testset "List top-level test sets" begin
@@ -43,11 +40,13 @@ end
     #     @test sort(seen) == [ "t", "t/a", "t/b", "t/c" ]
     # end
 
-    case("Run all tests",
+    global results = case("Run all tests",
         [ "t/a/1", "t/a/2", "t/a/3",
           "t/b/1", "t/b/2", "t/b/3",
           "t/c/1", "t/c/2", "t/c/3" ]
     )
+
+    printstyled(results, "\n"; color=:blue)
 
     # case("Run everything under 't/a'",
     #     [ "t/a/1", "t/a/2", "t/a/3" ],

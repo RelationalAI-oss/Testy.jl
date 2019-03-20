@@ -7,16 +7,17 @@ using Test
 
 include("pmatch.jl")
 
-eat(args...) = nothing
-
-const trace_enabled = false
+const trace_enabled = true
 if trace_enabled
-    trace = print
-    traceln = println
+    trace(args...; color=:magenta, bold=false) = printstyled(args...; color=color, bold=bold)
+    traceln(args...; color=:magenta, bold=false) = trace(args..., '\n'; color=color, bold=bold)
 else
+    eat(args...; color=:magenta, bold=false) = nothing
     trace = eat
     traceln = eat
 end
+
+const DefaultTestSet = Test.DefaultTestSet
 
 # struct TestySet <: Test.AbstractTestSet
 #     parent::Test.DefaultTestSet
@@ -36,6 +37,13 @@ end
 #     Test.finish(ts.parent)
 # end
 
+struct WorkerResult{T}
+    testset::Int
+    depth::Int
+    workerid::Int
+    result::T
+end
+
 """
 State for parallel test workers.
 """
@@ -44,7 +52,7 @@ mutable struct ParallelState
     jobs::AbstractChannel{Int}
 
     # Channel for sending results
-    results::AbstractChannel{Any}
+    results::AbstractChannel{WorkerResult}
 
     # Index of the next top-level @testset this worker should run
     ts_next::Int
@@ -70,18 +78,23 @@ mutable struct TestState
 
     # state for parallel workers
     parallel_state::Union{ParallelState, Nothing}
+
+    workerid::Int
 end
 
 const ⊤ = r""       # matches any string
 const ⊥ = r"(?!)"   # matches no string
 
-TestState() = TestState([], ⊤, ⊥, [], false, 0, 0, nothing)
+TestState() = TestState([], ⊤, ⊥, [], false, 0, 0, nothing, 0)
 
 TestState(include::Regex, exclude::Regex, dryrun::Bool) =
-   TestState([], include, exclude, [], dryrun, 0, 0, nothing)
+   TestState([], include, exclude, [], dryrun, 0, 0, nothing, 0)
 
 TestState(s::TestState) = TestState(copy(s.stack), s.include, s.exclude,
-    copy(s.seen), s.dryrun, s.ts_depth, s.ts_count, s.parallel_state)
+    copy(s.seen), s.dryrun, s.ts_depth, s.ts_count, s.parallel_state, s.workerid)
+
+WorkerResult(state::TestState, result::T) where T =
+    WorkerResult{T}(state.ts_count, state.ts_depth, state.workerid, result)
 
 function open_testset(rs::TestState, name::String, testsuite::Bool)
     # Guard against nesting of @testsuite under @testset
@@ -95,11 +108,13 @@ function open_testset(rs::TestState, name::String, testsuite::Bool)
     end
 
     push!(rs.stack, name)
-    join(rs.stack, "/")
+    path = join(rs.stack, "/")
+    traceln("open_testset $(rs.stack)")
+    path
 end
 
 function close_testset(rs::TestState, testsuite::Bool, shouldrun::Bool)
-    traceln("Closing $(rs.stack)")
+    traceln("close_testset $(rs.stack)")
     pop!(rs.stack)
     if !testsuite
         rs.ts_depth -= 1
@@ -114,26 +129,33 @@ function close_testset(rs::TestState, testsuite::Bool, shouldrun::Bool)
     end
 end
 
+# !(a && !b) ≡ (!a || b)
+# dry run and a test set?  =>  don't go inside!
+
 function ts_should_run(rs::TestState, path::String, testsuite::Bool)
-    if !(rs.dryrun && !testsuite) &&
+    trace("ts_should_run($rs, $path, $testsuite) ")
+    if (!rs.dryrun || testsuite) &&
         pmatch(rs.include, path) != nothing &&
         pmatch(rs.exclude, path) == nothing
 
         if testsuite || rs.parallel_state == nothing
+            trace(" => true (#1)")
             return true
         elseif rs.parallel_state != nothing &&
             rs.ts_count == rs.parallel_state.ts_next
+            trace(" => true (#2)")
             return true
         end
-
+        trace(" => false (#3)")
     end
+    trace(" => false (#4)")
     return false
 end
 
-function tally(state::TestState, set::Test.AbstractTestSet)
+function tally(state::TestState, set::Test.DefaultTestSet)
     if state.parallel_state != nothing
         traceln("Putting result...")
-        put!(state.parallel_state.results, set)
+        put!(state.parallel_state.results, WorkerResult(state, set))
         traceln("Done.")
     end
 end
@@ -141,7 +163,7 @@ end
 function tally(state::TestState, err::Exception)
     if state.parallel_state != nothing
         traceln("Putting exception...")
-        put!(state.parallel_state.results, err)
+        put!(state.parallel_state.results, WorkerResult(state, err))
         traceln("Done.")
     end
 end
@@ -152,13 +174,13 @@ function tally(state::TestState, sets::AbstractVector)
     end
 end
 
-function tally(state::TestState, any)
-    printstyled("tally\n"; color=:light_red)
-    for fr in stacktrace()
-        printstyled(" $fr\n", color=:light_red)
-    end
-    error(stacktrace())
-end
+# function tally(state::TestState, any)
+#     printstyled("tally\n"; color=:light_red)
+#     for fr in stacktrace()
+#         printstyled(" $fr\n", color=:light_red)
+#     end
+#     error(stacktrace())
+# end
 
 function checked_ts_expr(name::Expr, ts_expr::Expr, testsuite::Bool, source)
     quote
@@ -171,7 +193,7 @@ function checked_ts_expr(name::Expr, ts_expr::Expr, testsuite::Bool, source)
 
         # Suppress status output during dry runs
         if !rs.dryrun
-            trace("  "^length(rs.stack))
+            print("  "^length(rs.stack))
             label = $testsuite ? "test suite" : "test set"
             if shouldrun
                 print("Running ")
@@ -182,23 +204,28 @@ function checked_ts_expr(name::Expr, ts_expr::Expr, testsuite::Bool, source)
             end
         end
 
+        ts = nothing
         if shouldrun
             try
                 ts = $ts_expr
+                traceln("checked_ts_expr: okay, ts=$ts")
                 tally(rs, ts)   # @testset ... begin ... end
             catch err
+                traceln("checked_ts_expr: caught $err")
                 err isa InterruptException && rethrow()
                 tally(rs, err)
             end
         end
 
         close_testset(rs, $testsuite, shouldrun)
+        traceln("returning $ts of type $(typeof(ts))")
+        return ts
     end
 end
 
 """
-Wrapped version of `Base.Test.@testset`.  In Testy, test sets are also the
-smallest unit of parallelism.
+Wrapped version of `Base.Test.@testset`.  In Testy, (top-level) test sets are
+also the smallest unit of parallelism.
 """
 macro testset(args...)
     ts_expr = esc(:($Test.@testset($(args...))))
@@ -208,8 +235,8 @@ end
 
 """
 Like `Base.Test.@testset`, but used at a higher level to encapsulate a
-collection of test sets (possibly further nested within suites) that can be run
-in parallel.
+collection of test sets that can be run in parallel.  Suites can be nested
+within suites, but not within sets.
 """
 macro testsuite(args...)
     ts_expr = esc(:($Test.@testset($(args...))))
@@ -265,62 +292,114 @@ function runtests(args...; filename::String="test/runtests.jl", dryrun::Bool=fal
     exclude = exact(join(excludes, "|"))
 
     state = TestState(include, exclude, dryrun)
-    num_workers = get_num_workers()
+    # num_workers = get_num_workers()
+    num_workers = 1
 
     if num_workers == 1 || dryrun
-        runtests_serial(filename, state)
+        result = runtests_serial(filename, state)
     else
-        runtests_parallel(filename, state, num_workers)
+        result = runtests_parallel(filename, state, num_workers)
     end
 
-    state
+    traceln("runtests: returning $((state, result))")
+    Test.print_test_results(result)
+    (state, result)
 end
 
 function runtests_serial(filename::String, state::TestState)
+    result = nothing
     task_local_storage(:__TESTY_STATE__, state) do
-        if state.dryrun
-            @suppress include(filename)
-        else
+        @testsuite "⊤" begin
+            result = Test.get_testset()
+            traceln(result == nothing; color=:blue)
             include(filename)
         end
     end
+    traceln(result == nothing; color=:blue)
+    result
 end
 
 function runtests_worker(path::String, filename::String, state::TestState,
     jobs::AbstractChannel, results::AbstractChannel, job::Int)
-    # try
+
+    topts = nothing
+    try
         traceln("path=$path, filename=$filename, job=$job")
 
+        state.workerid = myid() == 1 ? job : myid()
         state.parallel_state = ParallelState(jobs, results, job)
         task_local_storage(:__TESTY_STATE__, state) do
             task_local_storage(:SOURCE_PATH, path) do
-                @suppress include(filename)
+                # KLUDGE: Base.Test will throw an exception for the topmost
+                # testset on failure, before we have a chance to report the
+                # results back to the master.  To deal we this we introduce a
+                # dummy topmost testset.
+                @testsuite "⊤" begin
+                    topts = Base.Test.get_testset()
+                    include(filename)
+                end
             end
         end
 
         traceln("Putting done...")
         # dump(results)
-        put!(results, state)
+        put!(results, WorkerResult(state, state))
         traceln("Done.")
-    # catch err
-    #     printstyled("EGADS!!!\n"; color=:green)
-    #     println(err)
-    #     printstyled("printing backtrace\n"; color=:green)
-    #     show(stacktrace(catch_backtrace()))
-    #     println()
-    #     printstyled("EGADS!!! (end)\n"; color=:green)
-    #     # rethrow(err)
-    # end
+    catch err
+        printstyled("EGADS!!!\n"; color=:green)
+        display(err)
+        if err isa LoadError
+            display(err.error)
+        end
+        printstyled("printing backtrace\n"; color=:green)
+        display(stacktrace(catch_backtrace()))
+        println()
+        printstyled("EGADS!!! (end)\n"; color=:green)
+        put!(results, WorkerResult(state, topts))
+        put!(results, WorkerResult(state, state))
+        # rethrow(err)
+    end
 end
 
-function ntests(filename::String, state::TestState)
+function count_tests(filename::String, state::TestState)
     state2 = TestState(state.include, state.exclude, true)
     runtests_serial(filename, state2)
+    traceln("count_tests: state2=$state2"; color=:light_cyan)
     state2.ts_count
 end
 
+function merge_testsets(sets::Vector{WorkerResult})
+    isempty(sets) && error("Empty input vector")
+    traceln("merge_testsets"; color=:underline)
+    for (i, set) in enumerate(sets)
+        traceln("[$i]\t", set)
+    end
+
+    ts = map(wr -> wr.result, sort(filter(wr -> wr.depth == 0, sets); by=(wr -> wr.testset)))
+    traceln("merge_testsets"; color=:underline)
+    for (i, t) in enumerate(ts)
+        traceln("[$i]\t", t)
+    end
+
+    # s1 = sets[1]
+    # agree = reduce(&, map(sets) do set
+    #     set isa Exception ||
+    #     (set.description == s1.description &&
+    #     set.n_passed == s1.n_passed &&
+    #     set.anynonpass == s1.anynonpass)
+    # end)
+    #
+    # agree || error("Disagreement in test sets $sets")
+
+    if !isempty(ts) && ts[1] isa DefaultTestSet
+        DefaultTestSet(ts[1].description, ts, ts[1].n_passed, ts[1].anynonpass)
+    else
+        error(ts)
+    end
+end
+
 function runtests_parallel(filename::String, state::TestState, num_workers::Int)
-    num_jobs = ntests(filename, state)
+    num_jobs = count_tests(filename, state)
     num_workers = max(min(num_workers, num_jobs), 1)
 
     # if num_workers == 1
@@ -328,14 +407,14 @@ function runtests_parallel(filename::String, state::TestState, num_workers::Int)
     #     @warn "Running tests in serial as $msg found"
     #     return runtests_serial(filename, state)
     # end
-    num_workers = 2
+    num_workers = 1
 
     printstyled("Running tests in parallel with $num_workers workers\n",
         color=:cyan)
 
-    result_vector = Vector{Any}()
+    result_vector = Vector{WorkerResult}()
 
-    try
+    # try
         jobs = #RemoteChannel() do
             Channel(ctype=Int, csize=0) do jobs
                 for i in num_workers+1:num_jobs
@@ -350,23 +429,24 @@ function runtests_parallel(filename::String, state::TestState, num_workers::Int)
 
         taskref = Ref{Task}()
         results = #RemoteChannel() do
-            Channel(ctype=Any, csize=0, taskref=taskref) do results
+            Channel(ctype=WorkerResult, csize=0, taskref=taskref) do results
                 completed = 0
                 while completed < num_workers
                     result = take!(results)
-                    traceln("Got result: $(typeof(result))")
+                    traceln("Got result: $result")
                     push!(result_vector, result)
-                    if result isa TestState
+                    if result.result isa Exception
                         completed += 1
-                    # elseif result isa Exception
-                    #     throw(result)
+                        show(result)
+                    elseif result.result isa TestState
+                        completed += 1
                     end
                 end
                 traceln("Done collecting results")
             end
         #end
 
-        path = task_local_storage(:SOURCE_PATH)
+        path = get(task_local_storage(), :SOURCE_PATH, pwd()*"/dummy")
 
         pids = workers()
         for i in 1:num_workers
@@ -384,21 +464,28 @@ function runtests_parallel(filename::String, state::TestState, num_workers::Int)
             println()
         end
 
-    catch err
-        sleep(20)
-        rethrow(err)
-    end
+        return merge_testsets(result_vector)
+
+    # catch err
+    #     rethrow(err)
+    # end
 end
 
-function collate_results!(state::TestState, results::Vector{Any})
-    for result in results
+last_state = nothing
+last_results = nothing
+
+function collate_results!(state::TestState, results::Vector{WorkerResult})
+    global last_state = state
+    global last_results = results
+    for wr in results
+        result = wr.result
         if result isa TestState
             traceln("collate_results: appending ", result.seen)
             append!(state.seen, result.seen)
         end
     end
     state.seen = unique(state.seen) # KLUDGE, FIXME
-    traceln("collage_results: => ", state.seen)
+    traceln("collate_results: => ", state.seen)
     state
 end
 
