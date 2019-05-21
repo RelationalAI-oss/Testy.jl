@@ -157,7 +157,13 @@ in `args`.  See alternative form of `runtests` for examples.
 """
 function runtests(filepath::String, args...)
     runtests(typemax(Int), args...) do
-        include(filepath)
+        @eval Main begin
+            # Construct a new throw-away module in which to run the tests
+            # (see https://github.com/RelationalAI-oss/Testy.jl/issues/2)
+            m = @eval Main module $(gensym("TestyModule")) end  # e.g. Main.##TestyModule#365
+            # Perform the include inside the new module m
+            m.include($filepath)
+        end
     end
 end
 
