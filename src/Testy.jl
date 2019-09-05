@@ -113,15 +113,17 @@ function checked_ts_expr(name::Expr, ts_expr::Expr)
         shouldrun = length(rs.stack) <= rs.maxdepth &&
                 pmatch(rs.include, path) != nothing && pmatch(rs.exclude, path) == nothing
         rs.seen[path] = shouldrun
-        if shouldrun
+        ts_obj = if shouldrun
             print("Running ")
             printstyled(path; bold=true)
             println(" tests...")
             $ts_expr
         else
             printstyled("Skipping $path tests...\n"; color=:light_black)
+            nothing
         end
         close_testset(rs)
+        ts_obj
     end
 end
 
