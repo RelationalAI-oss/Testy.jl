@@ -19,7 +19,9 @@ function pexec(re, subject, offset, options, match_data)
                end)
     # rc == -1 means no match, -2 means partial match.
     rc < -2 && error("PCRE.exec error: $(err_message(rc))")
-    rc
+    (rc >= 0 ||
+        # Allow partial matches if they were requested in the options.
+        ((options & Base.PCRE.PARTIAL_HARD != 0 || options & Base.PCRE.PARTIAL_SOFT != 0) && rc == -2))
 end
 
 # Helper to call `pexec` w/ thread-safe match data: Mirrors Base.PCRE.exec_r_data
@@ -41,8 +43,8 @@ function pmatch(re::Regex, str::Union{SubString{String}, String}, idx::Integer, 
     opts = re.match_options | add_opts
     @static if VERSION >= v"1.3-"
         # rc == -1 means no match, -2 means partial match.
-        rc, data = pexec_r_data(re.regex, str, idx-1, opts)
-        if rc == -1 || (rc == -2 && (re.match_options & Base.PCRE.PARTIAL_HARD) == 0)
+        matched, data = pexec_r_data(re.regex, str, idx-1, opts)
+        if !matched
             Base.PCRE.free_match_data(data)
             return nothing
         end
@@ -58,8 +60,8 @@ function pmatch(re::Regex, str::Union{SubString{String}, String}, idx::Integer, 
         return result
     else  #  Julia VERSION < v"1.3"
         # rc == -1 means no match, -2 means partial match.
-        rc = pexec(re.regex, str, idx-1, opts, re.match_data)
-        if rc == -1 || (rc == -2 && (re.match_options & Base.PCRE.PARTIAL_HARD) == 0)
+        matched = pexec(re.regex, str, idx-1, opts, re.match_data)
+        if !matched
             return nothing
         end
         ovec = re.ovec
