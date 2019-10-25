@@ -1,5 +1,27 @@
 module Runtests
 
+# ====================
+# Testing the partial regex implementation in Testy
+module RegexTests
+using Test  # For testing the behavior
+import Testy  # The behavior to test
+
+@testset "partial regexes" begin
+    date_re = Testy.partial(raw"^\d\d-\d\d-\d\d\d\d")  # DD-MM-YYYY Date specifier
+
+    # Full match
+    @test Testy.pmatch(date_re, "22-02-20") !== nothing
+    # Partial matches
+    @test Testy.pmatch(date_re, "22-02") !== nothing
+    @test Testy.pmatch(date_re, "22-") !== nothing
+    # Non-matches
+    @test Testy.pmatch(date_re, "-2") === nothing
+    @test Testy.pmatch(date_re, "-22-") === nothing
+    @test Testy.pmatch(date_re, "") === nothing
+end
+end
+# ====================
+
 using Testy
 
 function test()
